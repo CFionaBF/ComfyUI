@@ -7,6 +7,7 @@ from io import BytesIO
 import torch
 from typing_extensions import override
 
+from comfy.utils import common_upscale
 from comfy_api.latest import IO, ComfyExtension, Input, Types
 from comfy_api_nodes.apis.bytedance import (
     RECOMMENDED_PRESETS,
@@ -129,6 +130,44 @@ def _prepare_seedance_image(image: Input.Image) -> Input.Image:
     image = downscale_image_tensor_by_max_side(image, max_side=6000)
     validate_image_dimensions(image, min_width=300, min_height=300, max_width=6000, max_height=6000)
     return image
+
+
+# Supported output aspect ratios, used to pre-size FLF frames to matching pixel pair to avoid the 1080p stretch jump.
+SEEDANCE2_RATIO_WH = {
+    "16:9": (16, 9),
+    "4:3": (4, 3),
+    "1:1": (1, 1),
+    "3:4": (3, 4),
+    "9:16": (9, 16),
+    "21:9": (21, 9),
+}
+SEEDANCE2_RES_SHORT_SIDE = {"480p": 480, "720p": 720, "1080p": 1080}
+
+
+def _seedance2_target_dims(resolution: str, ratio: str, image: torch.Tensor) -> tuple[int, int]:
+    """Exact supported output (width, height) for (resolution, ratio).
+
+    The shorter side equals the resolution number (e.g. 1080p 16:9 -> 1920x1080). For ratio
+    "adaptive" (or any unexpected value) the ratio is derived from the image's own aspect, snapped
+    to the nearest supported ratio, so the output keeps the frame's orientation.
+    """
+    short = SEEDANCE2_RES_SHORT_SIDE[resolution]
+    if ratio not in SEEDANCE2_RATIO_WH:
+        aspect = image.shape[-2] / image.shape[-3]  # W / H; tensor is (B, H, W, C)
+        ratio = min(SEEDANCE2_RATIO_WH, key=lambda k: abs(SEEDANCE2_RATIO_WH[k][0] / SEEDANCE2_RATIO_WH[k][1] - aspect))
+    rw, rh = SEEDANCE2_RATIO_WH[ratio]
+    if rw >= rh:  # landscape or square: shorter side is the height
+        out_w, out_h = round(short * rw / rh), short
+    else:  # portrait: shorter side is the width
+        out_w, out_h = short, round(short * rh / rw)
+    return out_w - out_w % 2, out_h - out_h % 2
+
+
+def _resize_to_exact(image: torch.Tensor, width: int, height: int) -> torch.Tensor:
+    """Center-crop to the target aspect and resize to exactly width x height (lanczos)."""
+    samples = image.movedim(-1, 1)  # (B, H, W, C) -> (B, C, H, W)
+    resized = common_upscale(samples, width, height, "lanczos", "center")
+    return resized.movedim(1, -1)
 
 
 async def _resolve_reference_assets(
@@ -1790,10 +1829,21 @@ class ByteDance2FirstLastFrameNode(IO.ComfyNode):
         if last_frame is not None and last_frame_asset_id:
             raise ValueError("Provide only one of last_frame or last_frame_asset_id, not both.")
 
+        # Resize the pinned frames to an exact Seedance-supported output pixel pair and submit with
+        # ratio="adaptive" (below) so both keyframes share one canvas with the generated interior.
+        # Confirmed fix for the 1080p FLF stretch/scale jump (Pylon #12314). The `ratio` widget still
+        # drives the result: it selects which supported pair we crop to; both frames share the pair
+        # derived from the first frame so the pinned endpoints stay on the same canvas.
+        target_dims: tuple[int, int] | None = None
         if first_frame is not None:
-            first_frame = _prepare_seedance_image(first_frame)
+            validate_image_aspect_ratio(first_frame, (2, 5), (5, 2), strict=False)  # 0.4 to 2.5
+            target_dims = _seedance2_target_dims(model["resolution"], model["ratio"], first_frame)
+            first_frame = _resize_to_exact(first_frame, *target_dims)
         if last_frame is not None:
-            last_frame = _prepare_seedance_image(last_frame)
+            validate_image_aspect_ratio(last_frame, (2, 5), (5, 2), strict=False)  # 0.4 to 2.5
+            if target_dims is None:
+                target_dims = _seedance2_target_dims(model["resolution"], model["ratio"], last_frame)
+            last_frame = _resize_to_exact(last_frame, *target_dims)
 
         asset_ids_to_resolve = [a for a in (first_frame_asset_id, last_frame_asset_id) if a]
         image_assets: dict[str, str] = {}
@@ -1844,7 +1894,7 @@ class ByteDance2FirstLastFrameNode(IO.ComfyNode):
                 content=content,
                 generate_audio=model["generate_audio"],
                 resolution=model["resolution"],
-                ratio=model["ratio"],
+                ratio="adaptive",
                 duration=model["duration"],
                 seed=seed,
                 watermark=watermark,
